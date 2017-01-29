@@ -52,16 +52,16 @@ class Proxy(object):
         self.execute_func = execute_func
         self.args = args
         self.kwargs = kwargs
-        assert 'result_box' not in kwargs, "The result_box should not be passed explicitly.  Use foo.pull(box)"
+        assert 'req_box' not in kwargs, "The req_box should not be passed explicitly.  Use foo.pull(box)"
 
     def dry_run(self, *args, **kwargs):
-        assert 'result_box' in kwargs, 'result_box must be passed as a keyword arg to dry_run()'
+        assert 'req_box' in kwargs, 'req_box must be passed as a keyword arg to dry_run()'
         self.dry_run_func(*args, **kwargs)
     
     def pull(self, box):
         box = np.asarray(box)
         assert box.ndim == 2 and box.shape[0] == 2 and box.shape[1] <= 5
-        kwargs = {'result_box': box}
+        kwargs = {'req_box': box}
         kwargs.update(self.kwargs)
         result_data = self.execute_func(*self.args, **kwargs)
         assert isinstance(result_data, BlockflowArray)
@@ -81,10 +81,10 @@ def proxy(dry_run_func):
     
 WINDOW_SIZE = 2.0
 
-@proxy(lambda arr, result_box: None)
-def read_array(arr, result_box=None):
+@proxy(lambda arr, req_box: None)
+def read_array(arr, req_box=None):
     full_array_box = shape_to_box(arr.shape)
-    valid_box, _, _ = box_intersection( full_array_box, result_box )
+    valid_box, _, _ = box_intersection( full_array_box, req_box )
     result = arr[slicing(valid_box)].view(BlockflowArray)
     result.box = valid_box
     return result
@@ -111,30 +111,30 @@ def vigra_filter_5d(filter_func, input_data, sigma, window_size, box_5d):
     return result
 
 @proxy(dry_run_pointwise_1)
-def gaussian( input_proxy, sigma, result_box=None ):
+def gaussian( input_proxy, sigma, req_box=None ):
     padding = np.ceil(np.array(sigma)*WINDOW_SIZE).astype(np.int64)
 
     # Ask for the fully padded input
-    requested_box = result_box.copy()
-    requested_box[0, 1:4] -= padding
-    requested_box[1, 1:4] += padding
-    input_data = input_proxy.pull(requested_box)
+    upstream_req_box = req_box.copy()
+    upstream_req_box[0, 1:4] -= padding
+    upstream_req_box[1, 1:4] += padding
+    input_data = input_proxy.pull(upstream_req_box)
 
     # The result is tagged with a box.
     # If we asked for too much (wider than the actual image),
     # then this box won't match what we requested.
-    retrieved_box = input_data.box
-    intersected, result_box_within_retrieved, _ = box_intersection(retrieved_box, result_box)
+    upstream_actual_box = input_data.box
+    result_box, req_box_within_upstream, _ = box_intersection(upstream_actual_box, req_box)
 
-    filtered = vigra_filter_5d(vigra.filters.gaussianSmoothing, input_data, sigma, WINDOW_SIZE, result_box_within_retrieved)
+    filtered = vigra_filter_5d(vigra.filters.gaussianSmoothing, input_data, sigma, WINDOW_SIZE, req_box_within_upstream)
     filtered = filtered.view(BlockflowArray)
-    filtered.box = intersected
+    filtered.box = result_box
     return filtered
 
 @proxy(dry_run_pointwise_1)
-def difference_of_gaussians(input_proxy, sigma_1, sigma_2, result_box=None):
-    a = gaussian(input_proxy, sigma_1).pull(result_box)
-    b = gaussian(input_proxy, sigma_2).pull(result_box)
+def difference_of_gaussians(input_proxy, sigma_1, sigma_2, req_box=None):
+    a = gaussian(input_proxy, sigma_1).pull(req_box)
+    b = gaussian(input_proxy, sigma_2).pull(req_box)
     
     # For pointwise numpy ufuncs, the result is already cast as 
     # a BlockflowArray, with the box already initialized.
