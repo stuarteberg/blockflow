@@ -1,8 +1,9 @@
 from itertools import starmap
 
 import numpy as np
+import networkx as nx
 import vigra
-
+import contextlib
 
 class BlockflowArray(np.ndarray):
     def __new__(cls, shape, dtype=float, buffer=None, offset=0, strides=None, order=None, box=None):
@@ -45,6 +46,9 @@ def box_intersection(box_a, box_b):
     
 class Operator(object):
     
+    def __init__(self, name=None):
+        self.name = name or self.__class__.__name__
+    
     def __call__(self, *args, **kwargs):
         return Proxy(self, *args, **kwargs)
 
@@ -53,6 +57,9 @@ class Operator(object):
 
     def execute(self, *args, **kwargs):
         raise NotImplementedError()
+
+    def __str__(self):
+        return self.name
 
 class Proxy(object):
     
@@ -63,10 +70,22 @@ class Proxy(object):
         assert 'req_box' not in kwargs, \
             "The req_box should not be passed to operators explicitly.  Use foo.pull(box)"
 
-    def dry_run(self, *args, **kwargs):
-        assert 'req_box' in kwargs, \
-            'req_box must be passed as a keyword arg to dry_run()'
-        self.op.dry_run(*args, **kwargs)
+    def dry_run(self, req_box):
+        if global_graph.mode == 'registration_dry_run':
+            global_graph.dag.add_node(self.op)
+            if global_graph.op_callstack:
+                caller = global_graph.op_callstack[-1]
+                global_graph.dag.add_edge(caller, self.op)
+                
+            global_graph.op_callstack.append(self.op)
+            try:
+                box = np.asarray(req_box)
+                assert box.ndim == 2 and box.shape[0] == 2 and box.shape[1] <= 5
+                kwargs = {'req_box': box}
+                kwargs.update(self.kwargs)
+                self.op.dry_run(*self.args, **kwargs)
+            finally:
+                global_graph.op_callstack.pop()
     
     def pull(self, box):
         box = np.asarray(box)
@@ -146,13 +165,14 @@ class Gaussian(Operator):
 
 class DifferenceOfGaussians(Operator):
 
-    def __init__(self):
-        self.gaussian_1 = Gaussian()
-        self.gaussian_2 = Gaussian()
+    def __init__(self, name=None):
+        super(DifferenceOfGaussians, self).__init__(name)
+        self.gaussian_1 = Gaussian('Gaussian-1')
+        self.gaussian_2 = Gaussian('Gaussian-2')
 
     def dry_run(self, input_proxy, sigma_1, sigma_2, req_box):
-        self.gaussian_1(input_proxy, sigma_1).dry_run()
-        self.gaussian_2(input_proxy, sigma_2).dry_run()
+        self.gaussian_1(input_proxy, sigma_1).dry_run(req_box)
+        self.gaussian_2(input_proxy, sigma_2).dry_run(req_box)
 
     def execute(self, input_proxy, sigma_1, sigma_2, req_box=None):
         a = self.gaussian_1(input_proxy, sigma_1).pull(req_box)
@@ -164,4 +184,20 @@ class DifferenceOfGaussians(Operator):
         return a - b 
 
 
+class Graph(object):
+    MODES = ['uninitialized', 'registration_dry_run', 'block_flow_dry_run', 'executable']
+    
+    def __init__(self):
+        self.op_callstack = []
+        self.dag = nx.DiGraph()
+        self.mode = 'uninitialized'
 
+    @contextlib.contextmanager
+    def register_calls(self):
+        assert len(self.op_callstack) == 0
+        self.mode = 'registration_dry_run'
+        yield
+        assert len(self.op_callstack) == 0
+        self.mode = 'executable'
+
+global_graph = Graph()
