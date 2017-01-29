@@ -1,4 +1,5 @@
 from itertools import starmap
+from functools import wraps
 
 import numpy as np
 import networkx as nx
@@ -75,7 +76,7 @@ class Proxy(object):
             global_graph.dag.add_node(self.op)
             if global_graph.op_callstack:
                 caller = global_graph.op_callstack[-1]
-                global_graph.dag.add_edge(caller, self.op)
+                global_graph.dag.add_edge(self.op, caller)
                 
             global_graph.op_callstack.append(self.op)
             try:
@@ -110,30 +111,57 @@ class ReadArray(Operator):
         result.box = valid_box
         return result
     
-def vigra_filter_5d(filter_func, input_data, sigma, window_size, box_5d):
+def wrap_filter_5d(filter_func):
     """
-    Utility function.
+    Decorator.
+    
     Given a 5D array (tzyxc), and corresponding output box,
     compute the given filter over the spatial dimensions.
     
     (It doesn't suffice to simply drop the 't' axis and run the filter,
     because singleton spatial dimensions would cause trouble.)
     """
-    # FIXME: Loop over time slices
-    input_data = vigra.taggedView(input_data, 'tzyxc')
-    assert box_5d.shape == (2,5)
+    @wraps(filter_func)
+    def wrapper(input_data, sigma, box_5d):
+        input_data = vigra.taggedView(input_data, 'tzyxc')
+        assert box_5d.shape == (2,5)
+        assert box_5d[1,0] - box_5d[0,0] == 1, \
+            "FIXME: Can't handle multiple time slices yet.  (Add a loop to this function.)"
 
-    nonsingleton_axes = (np.array(input_data.shape) != 1).nonzero()[0]
-    box_3d = box_5d[:, nonsingleton_axes]
+        # Find the non-singleton axes, so we can keep only them
+        # but also keep channel, no matter what    
+        input_shape_nochannel = np.array(input_data.shape[:-1])
+        nonsingleton_axes = (input_shape_nochannel != 1).nonzero()[0]
+        nonsingleton_axes = tuple(nonsingleton_axes) + (4,) # Keep channel
+        box = box_5d[:, nonsingleton_axes] # Might be a 2D OR 3D box
+
+        # Squeeze, but keep channel                
+        squeezed_input = input_data.squeeze()
+        if 'c' not in squeezed_input.axistags.keys():
+            squeezed_input = squeezed_input.insertChannelAxis(-1)
+
+        result = filter_func(squeezed_input, sigma, box=box)
+        result = result.withAxes(*'tzyxc')
+        return result
+    return wrapper
+
+
+class ConvolutionalFilter(Operator):
+
+    WINDOW_SIZE = 2.0 # Subclasses may override this
     
-    squeezed_input = input_data.squeeze()
-    result = filter_func(squeezed_input, sigma, roi=box_3d.tolist(), window_size=window_size)
-    result = result.withAxes(*'tzyxc')
-    return result
-
-class Gaussian(Operator):
-
-    WINDOW_SIZE = 2.0
+    def __init__(self, name=None):
+        super(ConvolutionalFilter, self).__init__(name)
+        self.filter_func_5d = wrap_filter_5d(self.filter_func)
+    
+    def filter_func(self, input_data, scale, box):
+        """
+        input_data: array data whose axes are one of the following: zyxc, yxc, zxc, zyc
+        scale: filter scale (sigma)
+        box: Not 5D.  Either 4D or 3D, depending on the dimensionality of input_data
+        """
+        raise NotImplementedError("Convolutional Filter '{}' must override filter_func()"
+                                  .format(self.__class__.__name__))
     
     def dry_run(self, input_proxy, sigma, req_box):
         upstream_req_box = self._get_upstream_box(sigma, req_box)
@@ -150,7 +178,7 @@ class Gaussian(Operator):
         upstream_actual_box = input_data.box
         result_box, req_box_within_upstream, _ = box_intersection(upstream_actual_box, req_box)
     
-        filtered = vigra_filter_5d(vigra.filters.gaussianSmoothing, input_data, sigma, self.WINDOW_SIZE, req_box_within_upstream)
+        filtered = self.filter_func_5d(input_data, sigma, req_box_within_upstream)
         filtered = filtered.view(BlockflowArray)
         filtered.box = result_box
         return filtered
@@ -162,13 +190,39 @@ class Gaussian(Operator):
         upstream_req_box[1, 1:4] += padding
         return upstream_req_box
         
+class GaussianSmoothing(ConvolutionalFilter):    
+    def filter_func(self, input_data, scale, box):
+        return vigra.filters.gaussianSmoothing(input_data, sigma=scale, window_size=self.WINDOW_SIZE, roi=box[:,:-1].tolist())
+
+class LaplacianOfGaussian(ConvolutionalFilter):
+    def filter_func(self, input_data, scale, box):
+        return vigra.filters.laplacianOfGaussian(input_data, scale=scale, window_size=self.WINDOW_SIZE, roi=box[:,:-1].tolist())
+
+class GaussianGradientMagnitude(ConvolutionalFilter):
+    def filter_func(self, input_data, scale, box):
+        return vigra.filters.gaussianGradientMagnitude(input_data, sigma=scale, window_size=self.WINDOW_SIZE, roi=box[:,:-1].tolist())
+
+class HessianOfGaussianEigenvalues(ConvolutionalFilter):
+    def filter_func(self, input_data, scale, box):
+        return vigra.filters.hessianOfGaussianEigenvalues(input_data, scale=scale, window_size=self.WINDOW_SIZE, roi=box[:,:-1].tolist())
+
+class StructureTensorEigenvalues(ConvolutionalFilter):
+    def filter_func(self, input_data, scale, box):
+        inner_scale = scale
+        outer_scale = scale / 2.0
+    
+        return vigra.filters.structureTensorEigenvalues(input_data,
+                                                        innerScale=inner_scale,
+                                                        outerScale=outer_scale,
+                                                        window_size=self.WINDOW_SIZE,
+                                                        roi=box[:,:-1].tolist())
 
 class DifferenceOfGaussians(Operator):
 
     def __init__(self, name=None):
         super(DifferenceOfGaussians, self).__init__(name)
-        self.gaussian_1 = Gaussian('Gaussian-1')
-        self.gaussian_2 = Gaussian('Gaussian-2')
+        self.gaussian_1 = GaussianSmoothing('Gaussian-1')
+        self.gaussian_2 = GaussianSmoothing('Gaussian-2')
 
     def dry_run(self, input_proxy, sigma_1, sigma_2, req_box):
         self.gaussian_1(input_proxy, sigma_1).dry_run(req_box)
