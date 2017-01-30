@@ -7,6 +7,9 @@ import vigra
 import contextlib
 import collections
 
+BOX_MIN = np.iinfo(np.int64).min
+BOX_MAX = np.iinfo(np.int64).max
+
 class BlockflowArray(np.ndarray):
     def __new__(cls, shape, dtype=float, buffer=None, offset=0, strides=None, order=None, box=None):
         obj = np.ndarray.__new__(cls, shape, dtype, buffer, offset, strides, order)
@@ -257,7 +260,6 @@ class PixelFeatures(Operator):
             feature_op(input_proxy, spec.scale).dry_run(req_box)
 
     def execute(self, input_proxy, filter_specs, req_box=None):
-        
         # FIXME: This requests all channels, no matter what.
         results = []
         for spec in filter_specs:
@@ -277,6 +279,31 @@ class PixelFeatures(Operator):
         except KeyError:
             feature_op = self.feature_ops[spec] = FilterNames[spec.name]()
         return feature_op
+
+class PredictPixels(Operator):
+    def dry_run(self, features_proxy, classifier, req_box):
+        upstream_box = req_box.copy()
+        upstream_box[:,-1] = (BOX_MIN,BOX_MAX) # Request all features
+        features_proxy.dry_run(upstream_box)
+    
+    def execute(self, features_proxy, classifier, req_box):
+        upstream_box = req_box.copy()
+        upstream_box[:,-1] = (BOX_MIN,BOX_MAX) # Request all features
+        feature_vol = features_proxy.pull(req_box)
+        prod = np.prod(feature_vol.shape[:-1])
+        feature_matrix = feature_vol.reshape((prod, feature_vol.shape[-1]))
+        probabilities_matrix = classifier.predict_probabilities( feature_matrix )
+        
+        # TODO: Somehow check for correct number of channels, in case the classifier returned fewer classes than we expected
+        #       (See lazyflow for example)        
+        probabilities_vol = probabilities_matrix.reshape(feature_vol.shape[:-1] + (-1,))
+
+        # Extract only the channel range that was originally requested
+        ch_start, ch_stop = req_box[:,-1]
+        probabilities_vol = probabilities_vol[..., ch_start:ch_stop]
+        probabilities_vol = probabilities_vol.view(BlockflowArray)
+        probabilities_vol.box = np.append(feature_vol.box[:,:-1], req_box[:,-1:], axis=1)
+        return probabilities_vol
 
 class Graph(object):
     MODES = ['uninitialized', 'registration_dry_run', 'block_flow_dry_run', 'executable']
