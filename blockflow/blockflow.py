@@ -221,10 +221,26 @@ class StructureTensorEigenvalues(ConvolutionalFilter):
                                                         window_size=self.WINDOW_SIZE,
                                                         roi=box[:,:-1].tolist())
 
-class DifferenceOfGaussians(Operator):
+class DifferenceOfGaussians(ConvolutionalFilter):
+    def filter_func(self, input_data, scale, box):
+        sigma_1 = scale
+        sigma_2 = 0.66*scale
+    
+        smoothed_1 = vigra.filters.gaussianSmoothing(input_data, sigma=sigma_1, window_size=self.WINDOW_SIZE, roi=box[:,:-1].tolist())
+        smoothed_2 = vigra.filters.gaussianSmoothing(input_data, sigma=sigma_2, window_size=self.WINDOW_SIZE, roi=box[:,:-1].tolist())
+        
+        # In-place subtraction
+        np.subtract( smoothed_1, smoothed_2, out=smoothed_1 )
+        return smoothed_1
+
+class DifferenceOfGaussiansComposite(Operator):
+    """
+    Alternative implementation of DifferenceOfGaussians,
+    but using internal operators for the two smoothing operations.
+    """
 
     def __init__(self, name=None):
-        super(DifferenceOfGaussians, self).__init__(name)
+        super(DifferenceOfGaussiansComposite, self).__init__(name)
         self.gaussian_1 = GaussianSmoothing('Gaussian-1')
         self.gaussian_2 = GaussianSmoothing('Gaussian-2')
 
@@ -245,9 +261,10 @@ FilterSpec = collections.namedtuple( 'FilterSpec', 'name scale' )
 FilterNames = { 'GaussianSmoothing': GaussianSmoothing,
                 'LaplacianOfGaussian': LaplacianOfGaussian,
                 'GaussianGradientMagnitude': GaussianGradientMagnitude,
+                'DifferenceOfGaussians': DifferenceOfGaussians,
+                #'DifferenceOfGaussians': DifferenceOfGaussiansComposite,
                 'HessianOfGaussianEigenvalues': HessianOfGaussianEigenvalues,
-                'StructureTensorEigenvalues': StructureTensorEigenvalues,
-                'DifferenceOfGaussians': DifferenceOfGaussians }
+                'StructureTensorEigenvalues': StructureTensorEigenvalues }
 
 class PixelFeatures(Operator):
     def __init__(self, name=None):
