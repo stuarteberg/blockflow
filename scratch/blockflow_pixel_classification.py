@@ -59,7 +59,7 @@ box = [(0,0,0,0,0), (1,1,400,600,10)] # actual image is smaller than this, but t
 
 # Construct call graph
 with global_graph.register_calls():
-    predict_proxy.dry_run(box)
+    predict_proxy.dry_pull(box)
 
 # Visualize graph
 dot_path = 'blockflow-graph.dot'

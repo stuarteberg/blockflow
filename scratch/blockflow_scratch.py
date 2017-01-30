@@ -39,12 +39,12 @@ box = [(0,0,0,0,0), (1,1,400,600,1)] # actual image is smaller than this, but th
 
 # Construct call graph
 with global_graph.register_calls():
-    gs_proxy.dry_run(box)
-    dog_proxy.dry_run(box)
-    log_proxy.dry_run(box)
-    ggm_proxy.dry_run(box)
-    hge_proxy.dry_run(box)
-    ste_proxy.dry_run(box)
+    gs_proxy.dry_pull(box)
+    dog_proxy.dry_pull(box)
+    log_proxy.dry_pull(box)
+    ggm_proxy.dry_pull(box)
+    hge_proxy.dry_pull(box)
+    ste_proxy.dry_pull(box)
 
 # Visualize graph
 dot_path = 'blockflow-graph.dot'

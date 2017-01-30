@@ -57,7 +57,7 @@ class Operator(object):
     def __call__(self, *args, **kwargs):
         return Proxy(self, *args, **kwargs)
 
-    def dry_run(self, *args, **kwargs):
+    def dry_execute(self, *args, **kwargs):
         raise NotImplementedError()
 
     def execute(self, *args, **kwargs):
@@ -75,7 +75,7 @@ class Proxy(object):
         assert 'req_box' not in kwargs, \
             "The req_box should not be passed to operators explicitly.  Use foo.pull(box)"
 
-    def dry_run(self, req_box):
+    def dry_pull(self, req_box):
         if global_graph.mode == 'registration_dry_run':
             global_graph.dag.add_node(self.op)
             if global_graph.op_callstack:
@@ -88,7 +88,7 @@ class Proxy(object):
                 assert box.ndim == 2 and box.shape[0] == 2 and box.shape[1] <= 5
                 kwargs = {'req_box': box}
                 kwargs.update(self.kwargs)
-                self.op.dry_run(*self.args, **kwargs)
+                self.op.dry_execute(*self.args, **kwargs)
             finally:
                 global_graph.op_callstack.pop()
     
@@ -105,7 +105,7 @@ class Proxy(object):
 
 class ReadArray(Operator):
     
-    def dry_run(self, arr, req_box):
+    def dry_execute(self, arr, req_box):
         pass
     
     def execute(self, arr, req_box=None):
@@ -167,9 +167,9 @@ class ConvolutionalFilter(Operator):
         raise NotImplementedError("Convolutional Filter '{}' must override filter_func()"
                                   .format(self.__class__.__name__))
     
-    def dry_run(self, input_proxy, scale, req_box):
+    def dry_execute(self, input_proxy, scale, req_box):
         upstream_req_box = self._get_upstream_box(scale, req_box)
-        input_proxy.dry_run(upstream_req_box)
+        input_proxy.dry_pull(upstream_req_box)
 
     def execute(self, input_proxy, scale, req_box=None):
         # Ask for the fully padded input
@@ -228,9 +228,9 @@ class DifferenceOfGaussians(Operator):
         self.gaussian_1 = GaussianSmoothing('Gaussian-1')
         self.gaussian_2 = GaussianSmoothing('Gaussian-2')
 
-    def dry_run(self, input_proxy, scale, req_box):
-        self.gaussian_1(input_proxy, scale).dry_run(req_box)
-        self.gaussian_2(input_proxy, scale*0.66).dry_run(req_box)
+    def dry_execute(self, input_proxy, scale, req_box):
+        self.gaussian_1(input_proxy, scale).dry_pull(req_box)
+        self.gaussian_2(input_proxy, scale*0.66).dry_pull(req_box)
 
     def execute(self, input_proxy, scale, req_box=None):
         a = self.gaussian_1(input_proxy, scale).pull(req_box)
@@ -254,10 +254,10 @@ class PixelFeatures(Operator):
         Operator.__init__(self, name)
         self.feature_ops = {} # (name, scale) : op
     
-    def dry_run(self, input_proxy, filter_specs, req_box):
+    def dry_execute(self, input_proxy, filter_specs, req_box):
         for spec in filter_specs:
             feature_op = self._get_filter_op(spec)
-            feature_op(input_proxy, spec.scale).dry_run(req_box)
+            feature_op(input_proxy, spec.scale).dry_pull(req_box)
 
     def execute(self, input_proxy, filter_specs, req_box=None):
         # FIXME: This requests all channels, no matter what.
@@ -281,10 +281,10 @@ class PixelFeatures(Operator):
         return feature_op
 
 class PredictPixels(Operator):
-    def dry_run(self, features_proxy, classifier, req_box):
+    def dry_execute(self, features_proxy, classifier, req_box):
         upstream_box = req_box.copy()
         upstream_box[:,-1] = (BOX_MIN,BOX_MAX) # Request all features
-        features_proxy.dry_run(upstream_box)
+        features_proxy.dry_pull(upstream_box)
     
     def execute(self, features_proxy, classifier, req_box):
         upstream_box = req_box.copy()
