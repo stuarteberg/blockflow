@@ -5,6 +5,7 @@ import numpy as np
 import networkx as nx
 import vigra
 import contextlib
+import collections
 
 class BlockflowArray(np.ndarray):
     def __new__(cls, shape, dtype=float, buffer=None, offset=0, strides=None, order=None, box=None):
@@ -122,7 +123,7 @@ def wrap_filter_5d(filter_func):
     because singleton spatial dimensions would cause trouble.)
     """
     @wraps(filter_func)
-    def wrapper(input_data, sigma, box_5d):
+    def wrapper(input_data, scale, box_5d):
         input_data = vigra.taggedView(input_data, 'tzyxc')
         assert box_5d.shape == (2,5)
         assert box_5d[1,0] - box_5d[0,0] == 1, \
@@ -140,7 +141,7 @@ def wrap_filter_5d(filter_func):
         if 'c' not in squeezed_input.axistags.keys():
             squeezed_input = squeezed_input.insertChannelAxis(-1)
 
-        result = filter_func(squeezed_input, sigma, box=box)
+        result = filter_func(squeezed_input, scale, box=box)
         result = result.withAxes(*'tzyxc')
         return result
     return wrapper
@@ -163,13 +164,13 @@ class ConvolutionalFilter(Operator):
         raise NotImplementedError("Convolutional Filter '{}' must override filter_func()"
                                   .format(self.__class__.__name__))
     
-    def dry_run(self, input_proxy, sigma, req_box):
-        upstream_req_box = self._get_upstream_box(sigma, req_box)
+    def dry_run(self, input_proxy, scale, req_box):
+        upstream_req_box = self._get_upstream_box(scale, req_box)
         input_proxy.dry_run(upstream_req_box)
 
-    def execute(self, input_proxy, sigma, req_box=None):
+    def execute(self, input_proxy, scale, req_box=None):
         # Ask for the fully padded input
-        upstream_req_box = self._get_upstream_box(sigma, req_box)
+        upstream_req_box = self._get_upstream_box(scale, req_box)
         input_data = input_proxy.pull(upstream_req_box)
     
         # The result is tagged with a box.
@@ -178,7 +179,7 @@ class ConvolutionalFilter(Operator):
         upstream_actual_box = input_data.box
         result_box, req_box_within_upstream, _ = box_intersection(upstream_actual_box, req_box)
     
-        filtered = self.filter_func_5d(input_data, sigma, req_box_within_upstream)
+        filtered = self.filter_func_5d(input_data, scale, req_box_within_upstream)
         filtered = filtered.view(BlockflowArray)
         filtered.box = result_box
         return filtered
@@ -224,19 +225,58 @@ class DifferenceOfGaussians(Operator):
         self.gaussian_1 = GaussianSmoothing('Gaussian-1')
         self.gaussian_2 = GaussianSmoothing('Gaussian-2')
 
-    def dry_run(self, input_proxy, sigma_1, sigma_2, req_box):
-        self.gaussian_1(input_proxy, sigma_1).dry_run(req_box)
-        self.gaussian_2(input_proxy, sigma_2).dry_run(req_box)
+    def dry_run(self, input_proxy, scale, req_box):
+        self.gaussian_1(input_proxy, scale).dry_run(req_box)
+        self.gaussian_2(input_proxy, scale*0.66).dry_run(req_box)
 
-    def execute(self, input_proxy, sigma_1, sigma_2, req_box=None):
-        a = self.gaussian_1(input_proxy, sigma_1).pull(req_box)
-        b = self.gaussian_2(input_proxy, sigma_2).pull(req_box)
+    def execute(self, input_proxy, scale, req_box=None):
+        a = self.gaussian_1(input_proxy, scale).pull(req_box)
+        b = self.gaussian_2(input_proxy, scale*0.66).pull(req_box)
         
         # For pointwise numpy ufuncs, the result is already cast as 
         # a BlockflowArray, with the box already initialized.
         # Nothing extra needed here.
         return a - b 
 
+FilterSpec = collections.namedtuple( 'FilterSpec', 'name scale' )
+FilterNames = { 'GaussianSmoothing': GaussianSmoothing,
+                'LaplacianOfGaussian': LaplacianOfGaussian,
+                'GaussianGradientMagnitude': GaussianGradientMagnitude,
+                'HessianOfGaussianEigenvalues': HessianOfGaussianEigenvalues,
+                'StructureTensorEigenvalues': StructureTensorEigenvalues,
+                'DifferenceOfGaussians': DifferenceOfGaussians }
+
+class PixelFeatures(Operator):
+    def __init__(self, name=None):
+        Operator.__init__(self, name)
+        self.feature_ops = {} # (name, scale) : op
+    
+    def dry_run(self, input_proxy, filter_specs, req_box):
+        for spec in filter_specs:
+            feature_op = self._get_filter_op(spec)
+            feature_op(input_proxy, spec.scale).dry_run(req_box)
+
+    def execute(self, input_proxy, filter_specs, req_box=None):
+        
+        # FIXME: This requests all channels, no matter what.
+        results = []
+        for spec in filter_specs:
+            feature_op = self._get_filter_op(spec)
+            feature_data = feature_op(input_proxy, spec.scale).pull(req_box)
+            results.append(feature_data)
+
+        stacked_data = np.concatenate(results, axis=-1)
+        stacked_data = stacked_data.view(BlockflowArray)
+        stacked_data.box = feature_data.box
+        stacked_data.box[:,-1] = req_box[:,-1]
+        return stacked_data
+
+    def _get_filter_op(self, spec):
+        try:
+            feature_op = self.feature_ops[spec]
+        except KeyError:
+            feature_op = self.feature_ops[spec] = FilterNames[spec.name]()
+        return feature_op
 
 class Graph(object):
     MODES = ['uninitialized', 'registration_dry_run', 'block_flow_dry_run', 'executable']

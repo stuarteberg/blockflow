@@ -6,7 +6,8 @@ import vigra
 from networkx.drawing import nx_pydot
 
 from blockflow import global_graph, ReadArray, GaussianSmoothing, LaplacianOfGaussian, DifferenceOfGaussians, \
-    GaussianGradientMagnitude, HessianOfGaussianEigenvalues, StructureTensorEigenvalues 
+    GaussianGradientMagnitude, HessianOfGaussianEigenvalues, StructureTensorEigenvalues, \
+    PixelFeatures
 
 os.chdir(os.path.dirname(__file__))
 
@@ -27,12 +28,11 @@ ste = StructureTensorEigenvalues()
 SCALE = 3.0
 input_proxy = read_array(zebra[None, None, ..., None])
 gs_proxy = gassian_smoothing(input_proxy, SCALE)
-dog_proxy = difference_of_gaussians(input_proxy, SCALE, SCALE*0.66)
+dog_proxy = difference_of_gaussians(input_proxy, SCALE)
 log_proxy = laplacian_of_gaussian(input_proxy, SCALE)
 ggm_proxy = ggm(input_proxy, SCALE)
 hge_proxy = hge(input_proxy, SCALE)
 ste_proxy = ste(input_proxy, SCALE)
-
 
 
 box = [(0,0,0,0,0), (1,1,400,600,1)] # actual image is smaller than this, but that's okay.
