@@ -32,22 +32,30 @@ class BlockflowArray(np.ndarray):
             if tuple(orig_box[1] - orig_box[0]) == self.shape:
                 self.box = orig_box
 
+class DryArray(BlockflowArray):
+    def __new__(cls, shape=(), dtype=float, buffer=None, offset=0, strides=None, order=None, box=None):
+        assert shape == () or np.prod(shape) == 0, "DryArray must have empty shape"
+        obj = BlockflowArray.__new__(cls, shape, dtype, buffer, offset, strides, order)
+        obj.box = box
+        return obj
+
 def slicing(box):
     return tuple( starmap( slice, zip(box[0], box[1]) ) )
 
 def shape_to_box(shape):
     return np.array( ((0,)*len(shape), shape) )
 
-def box_intersection(box_a, box_b):
+def box_intersection(box_a, box_b, inner_boxes=False):
     intersection = np.array(box_a)
     intersection[0] = np.maximum( box_a[0], box_b[0] )
     intersection[1] = np.minimum( box_a[1], box_b[1] )
 
-    intersection_within_a = intersection - box_a[0]
-    intersection_within_b = intersection - box_b[0]
-    intersection_global = intersection
-
-    return intersection_global, intersection_within_a, intersection_within_b
+    if inner_boxes:
+        intersection_within_a = intersection - box_a[0]
+        intersection_within_b = intersection - box_b[0]
+        return intersection, intersection_within_a, intersection_within_b
+    else:
+        return intersection
     
 class Operator(object):
     
@@ -75,7 +83,7 @@ class Operator(object):
                 assert box.ndim == 2 and box.shape[0] == 2 and box.shape[1] <= 5
                 kwargs = {'req_box': box}
                 kwargs.update(self.kwargs)
-                self.dry_execute(*self.args, **kwargs)
+                return self.dry_execute(*self.args, **kwargs)
             finally:
                 global_graph.op_callstack.pop()
 
@@ -102,14 +110,19 @@ class Operator(object):
 class ReadArray(Operator):
     
     def dry_execute(self, arr, req_box):
-        pass
+        return DryArray(box=self._clip_box(arr, req_box))
     
     def execute(self, arr, req_box=None):
-        full_array_box = shape_to_box(arr.shape)
-        valid_box, _, _ = box_intersection( full_array_box, req_box )
-        result = arr[slicing(valid_box)].view(BlockflowArray)
-        result.box = valid_box
+        clipped_box = self._clip_box(arr, req_box)
+        result = arr[slicing(clipped_box)].view(BlockflowArray)
+        result.box = clipped_box
         return result
+
+    def _clip_box(self, arr, req_box):
+        full_array_box = shape_to_box(arr.shape)
+        valid_box = box_intersection(full_array_box, req_box)
+        return valid_box
+        
     
 def wrap_filter_5d(filter_func):
     """
@@ -163,9 +176,29 @@ class ConvolutionalFilter(Operator):
         raise NotImplementedError("Convolutional Filter '{}' must override filter_func()"
                                   .format(self.__class__.__name__))
     
+    def num_channels_for_input_box(self, box):
+        # Default implementation: One output channel per input channel,
+        # regardless of dimensions
+        return box[1,-1] - box[0,-1]
+
+    def num_channels_for_input_box_vector_valued(self, box):
+        """
+        For vector-valued filters whose output channels is N*C
+        """
+        shape = box[1] - box[0]
+        shape_zyx = shape[1:4]
+        ndim = (shape_zyx > 1).sum()
+        channels = shape[-1]
+        return ndim*channels
+    
     def dry_execute(self, input_op, scale, req_box):
         upstream_req_box = self._get_upstream_box(scale, req_box)
-        input_op.dry_pull(upstream_req_box)
+        empty_data = input_op.dry_pull(upstream_req_box)
+        n_channels = self.num_channels_for_input_box(empty_data.box)
+        box = empty_data.box.copy()
+        box[:,-1] = (0, n_channels)
+        box = box_intersection(box, req_box)
+        return DryArray(box=box)
 
     def execute(self, input_op, scale, req_box=None):
         # Ask for the fully padded input
@@ -176,7 +209,7 @@ class ConvolutionalFilter(Operator):
         # If we asked for too much (wider than the actual image),
         # then this box won't match what we requested.
         upstream_actual_box = input_data.box
-        result_box, req_box_within_upstream, _ = box_intersection(upstream_actual_box, req_box)
+        result_box, req_box_within_upstream, _ = box_intersection(upstream_actual_box, req_box, True)
     
         filtered = self.filter_func_5d(input_data, scale, req_box_within_upstream)
         filtered = filtered.view(BlockflowArray)
@@ -203,10 +236,13 @@ class GaussianGradientMagnitude(ConvolutionalFilter):
         return vigra.filters.gaussianGradientMagnitude(input_data, sigma=scale, window_size=self.WINDOW_SIZE, roi=box[:,:-1].tolist())
 
 class HessianOfGaussianEigenvalues(ConvolutionalFilter):
+    num_channels_for_input_box = ConvolutionalFilter.num_channels_for_input_box_vector_valued
     def filter_func(self, input_data, scale, box):
         return vigra.filters.hessianOfGaussianEigenvalues(input_data, scale=scale, window_size=self.WINDOW_SIZE, roi=box[:,:-1].tolist())
 
+
 class StructureTensorEigenvalues(ConvolutionalFilter):
+    num_channels_for_input_box = ConvolutionalFilter.num_channels_for_input_box_vector_valued
     def filter_func(self, input_data, scale, box):
         inner_scale = scale
         outer_scale = scale / 2.0
@@ -217,6 +253,7 @@ class StructureTensorEigenvalues(ConvolutionalFilter):
                                                         window_size=self.WINDOW_SIZE,
                                                         roi=box[:,:-1].tolist())
 
+    
 class DifferenceOfGaussians(ConvolutionalFilter):
     def filter_func(self, input_data, scale, box):
         sigma_1 = scale
@@ -241,8 +278,10 @@ class DifferenceOfGaussiansComposite(Operator):
         self.gaussian_2 = GaussianSmoothing('Gaussian-2')
 
     def dry_execute(self, input_op, scale, req_box):
-        self.gaussian_1(input_op, scale).dry_pull(req_box)
-        self.gaussian_2(input_op, scale*0.66).dry_pull(req_box)
+        empty_1 = self.gaussian_1(input_op, scale).dry_pull(req_box)
+        empty_2 = self.gaussian_2(input_op, scale*0.66).dry_pull(req_box)
+        assert (empty_1.box == empty_2.box).all()
+        return empty_1
 
     def execute(self, input_op, scale, req_box=None):
         a = self.gaussian_1(input_op, scale).pull(req_box)
@@ -268,9 +307,18 @@ class PixelFeatures(Operator):
         self.feature_ops = {} # (name, scale) : op
     
     def dry_execute(self, input_op, filter_specs, req_box):
+        n_channels = 0
         for spec in filter_specs:
             feature_op = self._get_filter_op(spec)
-            feature_op(input_op, spec.scale).dry_pull(req_box)
+            empty = feature_op(input_op, spec.scale).dry_pull(req_box)
+            n_channels += empty.box[1, -1]
+
+        box = empty.box.copy()
+        box[:,-1] = (0, n_channels) 
+        
+        # Restrict to requested channels
+        box = box_intersection(box, req_box)
+        return DryArray(box=box)
 
     def execute(self, input_op, filter_specs, req_box=None):
         # FIXME: This requests all channels, no matter what.
@@ -281,6 +329,10 @@ class PixelFeatures(Operator):
             results.append(feature_data)
 
         stacked_data = np.concatenate(results, axis=-1)
+        
+        # Select only the requested channels
+        stacked_data = stacked_data[..., slice(*req_box[:,-1])]
+
         stacked_data = stacked_data.view(BlockflowArray)
         stacked_data.box = feature_data.box
         stacked_data.box[:,-1] = req_box[:,-1]
@@ -297,12 +349,17 @@ class PredictPixels(Operator):
     def dry_execute(self, features_op, classifier, req_box):
         upstream_box = req_box.copy()
         upstream_box[:,-1] = (BOX_MIN,BOX_MAX) # Request all features
-        features_op.dry_pull(upstream_box)
+        empty_feats = features_op.dry_pull(upstream_box)
+
+        out_box = empty_feats.box.copy()
+        out_box[:,-1] = (0, len(classifier.known_classes))
+        out_box = box_intersection(out_box, req_box)
+        return DryArray(dtype=np.float32, box=out_box)
     
     def execute(self, features_op, classifier, req_box):
         upstream_box = req_box.copy()
         upstream_box[:,-1] = (BOX_MIN,BOX_MAX) # Request all features
-        feature_vol = features_op.pull(req_box)
+        feature_vol = features_op.pull(upstream_box)
         prod = np.prod(feature_vol.shape[:-1])
         feature_matrix = feature_vol.reshape((prod, feature_vol.shape[-1]))
         probabilities_matrix = classifier.predict_probabilities( feature_matrix )
