@@ -51,15 +51,15 @@ read_array = ReadArray()
 pf = PixelFeatures()
 predict = PredictPixels()
 
-input_proxy = read_array(zebra[None, None, ..., None])
-pf_proxy = pf(input_proxy, filter_specs)
-predict_proxy = predict(pf_proxy, classifier)
+input_op = read_array(zebra[None, None, ..., None])
+pf_op = pf(input_op, filter_specs)
+predict_op = predict(pf_op, classifier)
 
 box = [(0,0,0,0,0), (1,1,400,600,10)] # actual image is smaller than this, but that's okay.
 
 # Construct call graph
 with global_graph.register_calls():
-    predict_proxy.dry_pull(box)
+    predict_op.dry_pull(box)
 
 # Visualize graph
 dot_path = 'blockflow-graph.dot'
@@ -68,12 +68,12 @@ subprocess.call('dot -Tpng -o {}.png {}'.format(dot_path, dot_path), shell=True)
 subprocess.call('open {}.png'.format(dot_path), shell=True)
 
 
-features = pf_proxy.pull( box )
+features = pf_op.pull( box )
 print features.shape
 #features = features.view(np.ndarray)
 np.save('zebra-features.npy', features)
 
-predictions = predict_proxy.pull( box )
+predictions = predict_op.pull( box )
 print predictions.shape
 
 # Normalize to uint8 range

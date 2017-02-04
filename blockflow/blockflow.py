@@ -55,7 +55,39 @@ class Operator(object):
         self.name = name or self.__class__.__name__
     
     def __call__(self, *args, **kwargs):
-        return Proxy(self, *args, **kwargs)
+        self.args = args
+        self.kwargs = kwargs
+        assert 'req_box' not in kwargs, \
+            "The req_box should not be passed to operators explicitly.  Use foo.pull(box)"
+        
+        return self
+
+    def dry_pull(self, req_box):
+        if global_graph.mode == 'registration_dry_run':
+            global_graph.dag.add_node(self)
+            if global_graph.op_callstack:
+                caller = global_graph.op_callstack[-1]
+                global_graph.dag.add_edge(self, caller)
+                
+            global_graph.op_callstack.append(self)
+            try:
+                box = np.asarray(req_box)
+                assert box.ndim == 2 and box.shape[0] == 2 and box.shape[1] <= 5
+                kwargs = {'req_box': box}
+                kwargs.update(self.kwargs)
+                self.dry_execute(*self.args, **kwargs)
+            finally:
+                global_graph.op_callstack.pop()
+
+    def pull(self, box):
+        box = np.asarray(box)
+        assert box.ndim == 2 and box.shape[0] == 2 and box.shape[1] <= 5
+        kwargs = {'req_box': box}
+        kwargs.update(self.kwargs)
+        result_data = self.execute(*self.args, **kwargs)
+        assert isinstance(result_data, BlockflowArray)
+        assert result_data.box is not None
+        return result_data
 
     def dry_execute(self, *args, **kwargs):
         raise NotImplementedError()
@@ -65,42 +97,6 @@ class Operator(object):
 
     def __str__(self):
         return self.name
-
-class Proxy(object):
-    
-    def __init__(self, op, *args, **kwargs):
-        self.op = op
-        self.args = args
-        self.kwargs = kwargs
-        assert 'req_box' not in kwargs, \
-            "The req_box should not be passed to operators explicitly.  Use foo.pull(box)"
-
-    def dry_pull(self, req_box):
-        if global_graph.mode == 'registration_dry_run':
-            global_graph.dag.add_node(self.op)
-            if global_graph.op_callstack:
-                caller = global_graph.op_callstack[-1]
-                global_graph.dag.add_edge(self.op, caller)
-                
-            global_graph.op_callstack.append(self.op)
-            try:
-                box = np.asarray(req_box)
-                assert box.ndim == 2 and box.shape[0] == 2 and box.shape[1] <= 5
-                kwargs = {'req_box': box}
-                kwargs.update(self.kwargs)
-                self.op.dry_execute(*self.args, **kwargs)
-            finally:
-                global_graph.op_callstack.pop()
-    
-    def pull(self, box):
-        box = np.asarray(box)
-        assert box.ndim == 2 and box.shape[0] == 2 and box.shape[1] <= 5
-        kwargs = {'req_box': box}
-        kwargs.update(self.kwargs)
-        result_data = self.op.execute(*self.args, **kwargs)
-        assert isinstance(result_data, BlockflowArray)
-        assert result_data.box is not None
-        return result_data
 
 
 class ReadArray(Operator):
@@ -167,14 +163,14 @@ class ConvolutionalFilter(Operator):
         raise NotImplementedError("Convolutional Filter '{}' must override filter_func()"
                                   .format(self.__class__.__name__))
     
-    def dry_execute(self, input_proxy, scale, req_box):
+    def dry_execute(self, input_op, scale, req_box):
         upstream_req_box = self._get_upstream_box(scale, req_box)
-        input_proxy.dry_pull(upstream_req_box)
+        input_op.dry_pull(upstream_req_box)
 
-    def execute(self, input_proxy, scale, req_box=None):
+    def execute(self, input_op, scale, req_box=None):
         # Ask for the fully padded input
         upstream_req_box = self._get_upstream_box(scale, req_box)
-        input_data = input_proxy.pull(upstream_req_box)
+        input_data = input_op.pull(upstream_req_box)
     
         # The result is tagged with a box.
         # If we asked for too much (wider than the actual image),
@@ -244,13 +240,13 @@ class DifferenceOfGaussiansComposite(Operator):
         self.gaussian_1 = GaussianSmoothing('Gaussian-1')
         self.gaussian_2 = GaussianSmoothing('Gaussian-2')
 
-    def dry_execute(self, input_proxy, scale, req_box):
-        self.gaussian_1(input_proxy, scale).dry_pull(req_box)
-        self.gaussian_2(input_proxy, scale*0.66).dry_pull(req_box)
+    def dry_execute(self, input_op, scale, req_box):
+        self.gaussian_1(input_op, scale).dry_pull(req_box)
+        self.gaussian_2(input_op, scale*0.66).dry_pull(req_box)
 
-    def execute(self, input_proxy, scale, req_box=None):
-        a = self.gaussian_1(input_proxy, scale).pull(req_box)
-        b = self.gaussian_2(input_proxy, scale*0.66).pull(req_box)
+    def execute(self, input_op, scale, req_box=None):
+        a = self.gaussian_1(input_op, scale).pull(req_box)
+        b = self.gaussian_2(input_op, scale*0.66).pull(req_box)
         
         # For pointwise numpy ufuncs, the result is already cast as 
         # a BlockflowArray, with the box already initialized.
@@ -271,17 +267,17 @@ class PixelFeatures(Operator):
         Operator.__init__(self, name)
         self.feature_ops = {} # (name, scale) : op
     
-    def dry_execute(self, input_proxy, filter_specs, req_box):
+    def dry_execute(self, input_op, filter_specs, req_box):
         for spec in filter_specs:
             feature_op = self._get_filter_op(spec)
-            feature_op(input_proxy, spec.scale).dry_pull(req_box)
+            feature_op(input_op, spec.scale).dry_pull(req_box)
 
-    def execute(self, input_proxy, filter_specs, req_box=None):
+    def execute(self, input_op, filter_specs, req_box=None):
         # FIXME: This requests all channels, no matter what.
         results = []
         for spec in filter_specs:
             feature_op = self._get_filter_op(spec)
-            feature_data = feature_op(input_proxy, spec.scale).pull(req_box)
+            feature_data = feature_op(input_op, spec.scale).pull(req_box)
             results.append(feature_data)
 
         stacked_data = np.concatenate(results, axis=-1)
@@ -298,15 +294,15 @@ class PixelFeatures(Operator):
         return feature_op
 
 class PredictPixels(Operator):
-    def dry_execute(self, features_proxy, classifier, req_box):
+    def dry_execute(self, features_op, classifier, req_box):
         upstream_box = req_box.copy()
         upstream_box[:,-1] = (BOX_MIN,BOX_MAX) # Request all features
-        features_proxy.dry_pull(upstream_box)
+        features_op.dry_pull(upstream_box)
     
-    def execute(self, features_proxy, classifier, req_box):
+    def execute(self, features_op, classifier, req_box):
         upstream_box = req_box.copy()
         upstream_box[:,-1] = (BOX_MIN,BOX_MAX) # Request all features
-        feature_vol = features_proxy.pull(req_box)
+        feature_vol = features_op.pull(req_box)
         prod = np.prod(feature_vol.shape[:-1])
         feature_matrix = feature_vol.reshape((prod, feature_vol.shape[-1]))
         probabilities_matrix = classifier.predict_probabilities( feature_matrix )

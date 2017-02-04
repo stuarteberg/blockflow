@@ -26,25 +26,25 @@ hge = HessianOfGaussianEigenvalues()
 ste = StructureTensorEigenvalues()
 
 SCALE = 3.0
-input_proxy = read_array(zebra[None, None, ..., None])
-gs_proxy = gassian_smoothing(input_proxy, SCALE)
-dog_proxy = difference_of_gaussians(input_proxy, SCALE)
-log_proxy = laplacian_of_gaussian(input_proxy, SCALE)
-ggm_proxy = ggm(input_proxy, SCALE)
-hge_proxy = hge(input_proxy, SCALE)
-ste_proxy = ste(input_proxy, SCALE)
+input_op = read_array(zebra[None, None, ..., None])
+gs_op = gassian_smoothing(input_op, SCALE)
+dog_op = difference_of_gaussians(input_op, SCALE)
+log_op = laplacian_of_gaussian(input_op, SCALE)
+ggm_op = ggm(input_op, SCALE)
+hge_op = hge(input_op, SCALE)
+ste_op = ste(input_op, SCALE)
 
 
 box = [(0,0,0,0,0), (1,1,400,600,1)] # actual image is smaller than this, but that's okay.
 
 # Construct call graph
 with global_graph.register_calls():
-    gs_proxy.dry_pull(box)
-    dog_proxy.dry_pull(box)
-    log_proxy.dry_pull(box)
-    ggm_proxy.dry_pull(box)
-    hge_proxy.dry_pull(box)
-    ste_proxy.dry_pull(box)
+    gs_op.dry_pull(box)
+    dog_op.dry_pull(box)
+    log_op.dry_pull(box)
+    ggm_op.dry_pull(box)
+    hge_op.dry_pull(box)
+    ste_op.dry_pull(box)
 
 # Visualize graph
 dot_path = 'blockflow-graph.dot'
@@ -53,9 +53,9 @@ subprocess.call('dot -Tpng -o {}.png {}'.format(dot_path, dot_path), shell=True)
 subprocess.call('open {}.png'.format(dot_path), shell=True)
 
 
-def pull_and_show(proxy, name):
+def pull_and_show(op, name):
     # Compute DoG filter
-    result = proxy.pull( box )
+    result = op.pull( box )
     print result.shape
     
     # Normalize to uint8 range
@@ -70,9 +70,9 @@ def pull_and_show(proxy, name):
     vigra.impex.writeImage(result[0,0,...], '{}-zebra.png'.format(name))
     subprocess.call('open {}-zebra.png'.format(name), shell=True)
 
-pull_and_show(gs_proxy, 'GS')
-pull_and_show(dog_proxy, 'DoG')
-pull_and_show(log_proxy, 'LoG')
-pull_and_show(ggm_proxy, 'GGM')
-pull_and_show(hge_proxy, 'HGE')
-pull_and_show(ste_proxy, 'STE')
+pull_and_show(gs_op, 'GS')
+pull_and_show(dog_op, 'DoG')
+pull_and_show(log_op, 'LoG')
+pull_and_show(ggm_op, 'GGM')
+pull_and_show(hge_op, 'HGE')
+pull_and_show(ste_op, 'STE')
