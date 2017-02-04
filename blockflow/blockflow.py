@@ -4,8 +4,8 @@ from functools import wraps
 import numpy as np
 import networkx as nx
 import vigra
-import contextlib
 import collections
+from contextlib import contextmanager
 
 BOX_MIN = np.iinfo(np.int64).min
 BOX_MAX = np.iinfo(np.int64).max
@@ -35,8 +35,7 @@ class BlockflowArray(np.ndarray):
 class DryArray(BlockflowArray):
     def __new__(cls, shape=(), dtype=float, buffer=None, offset=0, strides=None, order=None, box=None):
         assert shape == () or np.prod(shape) == 0, "DryArray must have empty shape"
-        obj = BlockflowArray.__new__(cls, shape, dtype, buffer, offset, strides, order)
-        obj.box = box
+        obj = BlockflowArray.__new__(cls, shape, dtype, buffer, offset, strides, order, box=box)
         return obj
 
 def slicing(box):
@@ -44,6 +43,14 @@ def slicing(box):
 
 def shape_to_box(shape):
     return np.array( ((0,)*len(shape), shape) )
+
+@contextmanager
+def readonly_array(a):
+    a = np.asarray(a)
+    writeable = a.flags['WRITEABLE']
+    a.flags['WRITEABLE'] = False
+    yield a
+    a.flags['WRITEABLE'] = writeable
 
 def box_intersection(box_a, box_b, inner_boxes=False):
     intersection = np.array(box_a)
@@ -67,35 +74,36 @@ class Operator(object):
         self.kwargs = kwargs
         assert 'req_box' not in kwargs, \
             "The req_box should not be passed to operators explicitly.  Use foo.pull(box)"
-        
         return self
 
-    def dry_pull(self, req_box):
-        if global_graph.mode == 'registration_dry_run':
-            global_graph.dag.add_node(self)
-            if global_graph.op_callstack:
-                caller = global_graph.op_callstack[-1]
-                global_graph.dag.add_edge(self, caller)
-                
-            global_graph.op_callstack.append(self)
-            try:
-                box = np.asarray(req_box)
-                assert box.ndim == 2 and box.shape[0] == 2 and box.shape[1] <= 5
-                kwargs = {'req_box': box}
-                kwargs.update(self.kwargs)
-                return self.dry_execute(*self.args, **kwargs)
-            finally:
-                global_graph.op_callstack.pop()
+    def dry_pull(self, box):
+        with readonly_array(box) as box:
+            assert box.ndim == 2 and box.shape[0] == 2 and box.shape[1] <= 5
+            kwargs = {'req_box': box}
+            kwargs.update(self.kwargs)
+
+            if global_graph.mode == 'registration_dry_run':
+                global_graph.dag.add_node(self)
+                if global_graph.op_callstack:
+                    caller = global_graph.op_callstack[-1]
+                    global_graph.dag.add_edge(self, caller)
+    
+                global_graph.op_callstack.append(self)
+                try:
+                    return self.dry_execute(*self.args, **kwargs)
+                finally:
+                    global_graph.op_callstack.pop()
 
     def pull(self, box):
-        box = np.asarray(box)
-        assert box.ndim == 2 and box.shape[0] == 2 and box.shape[1] <= 5
-        kwargs = {'req_box': box}
-        kwargs.update(self.kwargs)
-        result_data = self.execute(*self.args, **kwargs)
-        assert isinstance(result_data, BlockflowArray)
-        assert result_data.box is not None
-        return result_data
+        with readonly_array(box) as box:
+            box = np.asarray(box)
+            assert box.ndim == 2 and box.shape[0] == 2 and box.shape[1] <= 5
+            kwargs = {'req_box': box}
+            kwargs.update(self.kwargs)
+            result_data = self.execute(*self.args, **kwargs)
+            assert isinstance(result_data, BlockflowArray)
+            assert result_data.box is not None
+            return result_data
 
     def dry_execute(self, *args, **kwargs):
         raise NotImplementedError()
@@ -383,7 +391,7 @@ class Graph(object):
         self.dag = nx.DiGraph()
         self.mode = 'uninitialized'
 
-    @contextlib.contextmanager
+    @contextmanager
     def register_calls(self):
         assert len(self.op_callstack) == 0
         self.mode = 'registration_dry_run'
