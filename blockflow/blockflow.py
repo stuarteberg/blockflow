@@ -203,6 +203,11 @@ class ConvolutionalFilter(Operator):
         filtered = self.filter_func_5d(input_data, scale, req_box_within_upstream)
         filtered = filtered.view(BlockflowArray)
         filtered.box = result_box
+        expected_channels = self.num_channels_for_input_box(upstream_actual_box)
+        assert filtered.shape[-1] == expected_channels, \
+            "Filter '{}' returned an unexpected number of channels: got {}, expected {}"\
+            .format(self.name, filtered.shape[-1], expected_channels)
+
         return filtered
 
     def _get_upstream_box(self, sigma, req_box):
