@@ -1,4 +1,3 @@
-from itertools import starmap
 from functools import wraps
 
 import numpy as np
@@ -7,8 +6,7 @@ import vigra
 import collections
 from contextlib import contextmanager
 
-BOX_MIN = np.iinfo(np.int64).min
-BOX_MAX = np.iinfo(np.int64).max
+from .box import Box
 
 class BlockflowArray(np.ndarray):
     def __new__(cls, shape, dtype=float, buffer=None, offset=0, strides=None, order=None, box=None):
@@ -38,32 +36,17 @@ class DryArray(BlockflowArray):
         obj = BlockflowArray.__new__(cls, shape, dtype, buffer, offset, strides, order, box=box)
         return obj
 
-def slicing(box):
-    return tuple( starmap( slice, zip(box[0], box[1]) ) )
-
-def shape_to_box(shape):
-    return np.array( ((0,)*len(shape), shape) )
 
 @contextmanager
 def readonly_array(a):
-    a = np.asarray(a)
+    a = np.asanyarray(a)
     writeable = a.flags['WRITEABLE']
     a.flags['WRITEABLE'] = False
     yield a
     a.flags['WRITEABLE'] = writeable
 
-def box_intersection(box_a, box_b, inner_boxes=False):
-    intersection = np.array(box_a)
-    intersection[0] = np.maximum( box_a[0], box_b[0] )
-    intersection[1] = np.minimum( box_a[1], box_b[1] )
 
-    if inner_boxes:
-        intersection_within_a = intersection - box_a[0]
-        intersection_within_b = intersection - box_b[0]
-        return intersection, intersection_within_a, intersection_within_b
-    else:
-        return intersection
-    
+
 class Operator(object):
     
     def __init__(self, name=None):
@@ -96,7 +79,6 @@ class Operator(object):
 
     def pull(self, box):
         with readonly_array(box) as box:
-            box = np.asarray(box)
             assert box.ndim == 2 and box.shape[0] == 2 and box.shape[1] <= 5
             kwargs = {'req_box': box}
             kwargs.update(self.kwargs)
@@ -122,13 +104,13 @@ class ReadArray(Operator):
     
     def execute(self, arr, req_box=None):
         clipped_box = self._clip_box(arr, req_box)
-        result = arr[slicing(clipped_box)].view(BlockflowArray)
+        result = arr[clipped_box.slicing()].view(BlockflowArray)
         result.box = clipped_box
         return result
 
     def _clip_box(self, arr, req_box):
-        full_array_box = shape_to_box(arr.shape)
-        valid_box = box_intersection(full_array_box, req_box)
+        full_array_box = Box.from_shape(arr.shape)
+        valid_box = full_array_box.intersection(req_box)
         return valid_box
         
     
@@ -187,16 +169,15 @@ class ConvolutionalFilter(Operator):
     def num_channels_for_input_box(self, box):
         # Default implementation: One output channel per input channel,
         # regardless of dimensions
-        return box[1,-1] - box[0,-1]
+        return box[1,'c'] - box[0,'c']
 
     def num_channels_for_input_box_vector_valued(self, box):
         """
         For vector-valued filters whose output channels is N*C
         """
-        shape = box[1] - box[0]
-        shape_zyx = shape[1:4]
+        shape_zyx = box[1,'zyx'] - box[0,'zyx']
         ndim = (shape_zyx > 1).sum()
-        channels = shape[-1]
+        channels = box.to_shape()[-1]
         return ndim*channels
     
     def dry_execute(self, input_op, scale, req_box):
@@ -205,7 +186,7 @@ class ConvolutionalFilter(Operator):
         n_channels = self.num_channels_for_input_box(empty_data.box)
         box = empty_data.box.copy()
         box[:,-1] = (0, n_channels)
-        box = box_intersection(box, req_box)
+        box = box.intersection(req_box)
         return DryArray(box=box)
 
     def execute(self, input_op, scale, req_box=None):
@@ -217,7 +198,7 @@ class ConvolutionalFilter(Operator):
         # If we asked for too much (wider than the actual image),
         # then this box won't match what we requested.
         upstream_actual_box = input_data.box
-        result_box, req_box_within_upstream, _ = box_intersection(upstream_actual_box, req_box, True)
+        result_box, req_box_within_upstream = upstream_actual_box.intersection(req_box, True)
     
         filtered = self.filter_func_5d(input_data, scale, req_box_within_upstream)
         filtered = filtered.view(BlockflowArray)
@@ -227,8 +208,8 @@ class ConvolutionalFilter(Operator):
     def _get_upstream_box(self, sigma, req_box):
         padding = np.ceil(np.array(sigma)*self.WINDOW_SIZE).astype(np.int64)
         upstream_req_box = req_box.copy()
-        upstream_req_box[0, 1:4] -= padding
-        upstream_req_box[1, 1:4] += padding
+        upstream_req_box[0, 'zyx'] -= padding
+        upstream_req_box[1, 'zyx'] += padding
         return upstream_req_box
         
 class GaussianSmoothing(ConvolutionalFilter):    
@@ -319,13 +300,13 @@ class PixelFeatures(Operator):
         for spec in filter_specs:
             feature_op = self._get_filter_op(spec)
             empty = feature_op(input_op, spec.scale).dry_pull(req_box)
-            n_channels += empty.box[1, -1]
+            n_channels += empty.box[1, 'c']
 
         box = empty.box.copy()
         box[:,-1] = (0, n_channels) 
         
         # Restrict to requested channels
-        box = box_intersection(box, req_box)
+        box = box.intersection(req_box)
         return DryArray(box=box)
 
     def execute(self, input_op, filter_specs, req_box=None):
@@ -356,17 +337,17 @@ class PixelFeatures(Operator):
 class PredictPixels(Operator):
     def dry_execute(self, features_op, classifier, req_box):
         upstream_box = req_box.copy()
-        upstream_box[:,-1] = (BOX_MIN,BOX_MAX) # Request all features
+        upstream_box[:,-1] = (Box.MIN,Box.MAX) # Request all features
         empty_feats = features_op.dry_pull(upstream_box)
 
         out_box = empty_feats.box.copy()
         out_box[:,-1] = (0, len(classifier.known_classes))
-        out_box = box_intersection(out_box, req_box)
+        out_box = out_box.intersection(req_box)
         return DryArray(dtype=np.float32, box=out_box)
     
     def execute(self, features_op, classifier, req_box):
         upstream_box = req_box.copy()
-        upstream_box[:,-1] = (BOX_MIN,BOX_MAX) # Request all features
+        upstream_box[:,-1] = (Box.MIN,Box.MAX) # Request all features
         feature_vol = features_op.pull(upstream_box)
         prod = np.prod(feature_vol.shape[:-1])
         feature_matrix = feature_vol.reshape((prod, feature_vol.shape[-1]))

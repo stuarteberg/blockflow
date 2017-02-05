@@ -6,7 +6,7 @@ import vigra
 import h5py
 from networkx.drawing import nx_pydot
 
-from blockflow import global_graph, ReadArray, PixelFeatures, FilterSpec, PredictPixels
+from blockflow import Box, global_graph, ReadArray, PixelFeatures, FilterSpec, PredictPixels
 
 from lazyflow.classifiers import ParallelVigraRfLazyflowClassifier
 
@@ -55,7 +55,18 @@ input_op = read_array(zebra[None, None, ..., None])
 pf_op = pf(input_op, filter_specs)
 predict_op = predict(pf_op, classifier)
 
-box = [(0,0,0,0,0), (1,1,400,600,10)] # actual image is smaller than this, but that's okay.
+box = Box([(0,0,0,0,0), (1,1,400,600,10)]) # actual image is smaller than this, but that's okay.
+
+box[:, 't'] = (0,1)
+box[1, 'zyx'] = (1,400,600)
+box[:, 'zyx'] = [(0,0,0),(1,400,600)]
+
+print repr(box)
+print box[:, 't']
+print box[1, 'zyx']
+
+boxes = set([box, box])
+assert box in boxes
 
 # Construct call graph
 with global_graph.register_calls():
